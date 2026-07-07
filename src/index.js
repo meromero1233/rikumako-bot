@@ -1,0 +1,367 @@
+import 'dotenv/config';
+import { Client, GatewayIntentBits, Events, ChannelType, EmbedBuilder } from 'discord.js';
+import { setupServer } from './commands/setupServer.js';
+import {
+  addTask, completeTask, deleteTask, getTasks, getPendingTasks,
+  setSubscribers, getSubscribers, getNextMilestone,
+  incrementWeeklyPosts, getWeeklyPosts, resetWeeklyPosts,
+} from './store.js';
+import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary } from './ai.js';
+import { CH } from './config.js';
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+// ─── ユーティリティ ──────────────────────────────────────────────────────────────
+
+function findChannel(guild, name) {
+  return guild.channels.cache.find(
+    (c) => c.type === ChannelType.GuildText && c.name === name,
+  );
+}
+
+function jstNow() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000);
+}
+
+function isMondayJST() {
+  return jstNow().getUTCDay() === 1;
+}
+
+function scheduleDailyJST(hourJST, callback) {
+  const hourUTC = (hourJST - 9 + 24) % 24;
+  function msUntilNext() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setUTCHours(hourUTC, 0, 0, 0);
+    if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+    return next - now;
+  }
+  function loop() { callback(); setTimeout(loop, msUntilNext()); }
+  setTimeout(loop, msUntilNext());
+}
+
+// ─── 登録者数バー表示 ────────────────────────────────────────────────────────────
+
+function buildProgressBar(current, next) {
+  if (!next) return '🏆 100万人達成！';
+  const pct = Math.min(current / next, 1);
+  const filled = Math.round(pct * 20);
+  const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+  return `\`${bar}\` ${(pct * 100).toFixed(1)}%`;
+}
+
+// ─── 毎朝の自動投稿 ──────────────────────────────────────────────────────────────
+
+async function postMorningRoutine() {
+  const pending = getPendingTasks();
+  const jst = jstNow();
+  const dateStr = jst.toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'long' });
+
+  for (const guild of client.guilds.cache.values()) {
+
+    // ── 今日のタスク投稿 ────────────────────────────────────────────────────────
+    const taskCh = findChannel(guild, CH.TASK);
+    if (taskCh) {
+      const taskLines = pending.length > 0
+        ? pending.map((t) => `> **#${t.id}** ${t.text}`).join('\n')
+        : '> 📭 現在タスクなし。`/task add` で追加しよう！';
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle(`📋 ${dateStr} のタスク確認`)
+        .setDescription(taskLines)
+        .setFooter({ text: '高島 | 完了したら /task done <番号> を入れてください。報告は義務です。' });
+
+      await taskCh.send({ content: `おはようございます。高島です。本日のタスクを確認します。`, embeds: [embed] }).catch(() => {});
+    }
+
+    // ── 脚本アイデア投稿（AIが生成）─────────────────────────────────────────────
+    const scriptCh = findChannel(guild, CH.SCRIPT);
+    if (scriptCh) {
+      await scriptCh.send('今日のネタを精査しています。少し待ってください。— 高島').catch(() => {});
+      try {
+        const idea = await generateScriptIdea();
+        const embed = new EmbedBuilder()
+          .setColor(0xeb459e)
+          .setTitle(`🎙️ ${dateStr} — 高島からのネタ提案`)
+          .setDescription(idea)
+          .setFooter({ text: '高島 | 採用する場合は /task add でタスクに入れること。判断は2人に任せます。' });
+        await scriptCh.send({ embeds: [embed] }).catch(() => {});
+      } catch (e) {
+        await scriptCh.send('⚠️ 高島です。本日はネタ提案の生成に失敗しました。APIを確認してください。').catch(() => {});
+        console.error('script idea error:', e);
+      }
+    }
+
+    // ── トレンド情報投稿（AIが生成）──────────────────────────────────────────────
+    const trendCh = findChannel(guild, CH.TREND);
+    if (trendCh) {
+      try {
+        const trends = await generateTrendIdeas();
+        const embed = new EmbedBuilder()
+          .setColor(0xfee75c)
+          .setTitle(`🔥 ${dateStr} — 高島のトレンド分析`)
+          .setDescription(trends)
+          .setFooter({ text: '高島 | 判定Aのものから検討してください。' });
+        await trendCh.send({ embeds: [embed] }).catch(() => {});
+      } catch (e) {
+        console.error('trend error:', e);
+      }
+    }
+
+    // ── 月曜は週次サマリーも ───────────────────────────────────────────────────
+    if (isMondayJST()) {
+      const chatCh = findChannel(guild, CH.CHAT);
+      if (chatCh) {
+        const subs = getSubscribers();
+        const next = getNextMilestone();
+        const posts = getWeeklyPosts();
+        try {
+          const summary = await generateWeeklySummary({
+            postsThisWeek: posts,
+            subscribers: subs,
+            nextMilestone: next,
+          });
+          const embed = new EmbedBuilder()
+            .setColor(0x57f287)
+            .setTitle('📊 週次レポート — 高島より')
+            .addFields(
+              { name: '📹 今週の投稿', value: `${posts}本`, inline: true },
+              { name: '👥 登録者数', value: `${subs.toLocaleString()}人`, inline: true },
+              { name: '🎯 次の目標', value: next ? `${next.toLocaleString()}人` : '100万人！', inline: true },
+            )
+            .setDescription('\n' + summary)
+            .setFooter({ text: '高島 | 数字は嘘をつきません。現実を見て、動いてください。' });
+          await chatCh.send({ embeds: [embed] }).catch(() => {});
+        } catch (e) {
+          console.error('weekly summary error:', e);
+        }
+        resetWeeklyPosts();
+      }
+    }
+  }
+}
+
+// ─── 起動 ──────────────────────────────────────────────────────────────────────
+
+client.once(Events.ClientReady, (c) => {
+  console.log(`✅ ログイン完了: ${c.user.tag}`);
+  scheduleDailyJST(9, postMorningRoutine);
+});
+
+// ─── スラッシュコマンド処理 ───────────────────────────────────────────────────────
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const { commandName } = interaction;
+
+  // ── /setup ──────────────────────────────────────────────────────────────────
+  if (commandName === 'setup') {
+    if (!interaction.memberPermissions?.has('Administrator')) {
+      return interaction.reply({ content: '管理者のみ実行できます。', ephemeral: true });
+    }
+    await interaction.deferReply({ ephemeral: true });
+    const log = await setupServer(interaction.guild);
+    await interaction.editReply(
+      log.length > 0
+        ? `セットアップ完了！\n${log.join('\n')}`
+        : '✅ すでにセットアップ済みです（変更なし）',
+    );
+    return;
+  }
+
+  // ── /task ────────────────────────────────────────────────────────────────────
+  if (commandName === 'task') {
+    const sub = interaction.options.getSubcommand();
+
+    if (sub === 'add') {
+      const text = interaction.options.getString('内容');
+      const task = addTask(text);
+      return interaction.reply(`承りました。**#${task.id}「${task.text}」** をタスクに追加しました。— 高島`);
+    }
+
+    if (sub === 'done') {
+      const id = interaction.options.getInteger('番号');
+      const task = completeTask(id);
+      if (!task) return interaction.reply({ content: `高島です。タスク #${id} は存在しないか、すでに完了しています。番号を確認してください。`, ephemeral: true });
+
+      const logCh = findChannel(interaction.guild, CH.DONE_LOG);
+      if (logCh) {
+        await logCh.send(`✅ **${interaction.user.displayName}** — **「${task.text}」** 完了。記録しました。— 高島`).catch(() => {});
+      }
+      return interaction.reply(`完了を確認しました。**「${task.text}」**、お疲れ様です。次に進んでください。— 高島`);
+    }
+
+    if (sub === 'delete') {
+      const id = interaction.options.getInteger('番号');
+      const ok = deleteTask(id);
+      return interaction.reply(
+        ok
+          ? `タスク #${id} を削除しました。意図的な削除であれば問題ありません。— 高島`
+          : { content: `高島です。タスク #${id} が見つかりません。番号を確認してください。`, ephemeral: true },
+      );
+    }
+
+    if (sub === 'list') {
+      const tasks = getTasks();
+      if (tasks.length === 0) {
+        return interaction.reply('現在タスクはありません。`/task add` で追加してください。動いていない時間は無駄です。— 高島');
+      }
+      const lines = tasks.map(
+        (t) => `${t.done ? '✅' : '⬜'} **#${t.id}** ${t.text}`,
+      );
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle('📋 タスク一覧')
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: '高島 | 未完了のものを潰すことに集中してください。' });
+      return interaction.reply({ embeds: [embed] });
+    }
+  }
+
+  // ── /subscribers ─────────────────────────────────────────────────────────────
+  if (commandName === 'subscribers') {
+    const n = interaction.options.getInteger('人数');
+    const { prev, current } = setSubscribers(n);
+    const next = getNextMilestone();
+    const diff = current - prev;
+
+    const diffLabel = diff > 0 ? `+${diff.toLocaleString()}人。順調です。` : diff < 0 ? `${diff.toLocaleString()}人。原因を分析してください。` : '変動なし。動画の本数と質を見直す必要があります。';
+    const embed = new EmbedBuilder()
+      .setColor(diff >= 0 ? 0x57f287 : 0xed4245)
+      .setTitle('📈 登録者数 更新報告 — 高島')
+      .addFields(
+        { name: '現在', value: `**${current.toLocaleString()}人**`, inline: true },
+        { name: '前回比', value: `${diff >= 0 ? '+' : ''}${diff.toLocaleString()}人`, inline: true },
+        { name: '次の目標', value: next ? `${next.toLocaleString()}人` : '🏆 100万人達成！', inline: true },
+      )
+      .setDescription(buildProgressBar(current, next) + `\n\n${diffLabel}`)
+      .setFooter({ text: '高島 | 数字は現実です。受け止めて、次の手を打ってください。' });
+
+    // 登録者チャンネルにも記録
+    const subsCh = findChannel(interaction.guild, CH.SUBSCRIBERS);
+    if (subsCh) {
+      await subsCh.send({ embeds: [embed] }).catch(() => {});
+    }
+
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // ── /progress ────────────────────────────────────────────────────────────────
+  if (commandName === 'progress') {
+    const subs = getSubscribers();
+    const next = getNextMilestone();
+    const pending = getPendingTasks();
+    const all = getTasks();
+    const done = all.filter((t) => t.done).length;
+
+    const embed = new EmbedBuilder()
+      .setColor(0xfee75c)
+      .setTitle('🎯 現状レポート — 高島')
+      .addFields(
+        { name: '👥 登録者数', value: `${subs.toLocaleString()}人`, inline: true },
+        { name: '🎯 次の目標', value: next ? `${next.toLocaleString()}人` : '100万人達成！', inline: true },
+        { name: '📹 今週の投稿', value: `${getWeeklyPosts()}本`, inline: true },
+        { name: '✅ 完了タスク', value: `${done}件`, inline: true },
+        { name: '⬜ 残りタスク', value: `${pending.length}件`, inline: true },
+      )
+      .setDescription('**目標まで**\n' + buildProgressBar(subs, next))
+      .setFooter({ text: '高島 | 現実から目を逸らさないこと。それだけが前に進む方法です。' });
+
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // ── /script ──────────────────────────────────────────────────────────────────
+  if (commandName === 'script') {
+    await interaction.deferReply();
+    try {
+      const idea = await generateScriptIdea();
+      const embed = new EmbedBuilder()
+        .setColor(0xeb459e)
+        .setTitle('🎙️ 高島からのネタ提案')
+        .setDescription(idea)
+        .setFooter({ text: '高島 | 採用・不採用はあなたたちが決めてください。私は材料を出すだけです。' });
+      return interaction.editReply({ embeds: [embed] });
+    } catch (e) {
+      console.error(e);
+      return interaction.editReply('高島です。現在ネタ提案の生成ができません。APIの状態を確認してください。');
+    }
+  }
+
+  // ── /trend ───────────────────────────────────────────────────────────────────
+  if (commandName === 'trend') {
+    await interaction.deferReply();
+    try {
+      const trends = await generateTrendIdeas();
+      const embed = new EmbedBuilder()
+        .setColor(0xfee75c)
+        .setTitle('🔥 高島のトレンド分析')
+        .setDescription(trends)
+        .setFooter({ text: '高島 | 判定Aから検討してください。時機を逃すと意味がありません。' });
+      return interaction.editReply({ embeds: [embed] });
+    } catch (e) {
+      console.error(e);
+      return interaction.editReply('高島です。トレンド分析の生成に失敗しました。後ほど再試行してください。');
+    }
+  }
+
+  // ── /ask ─────────────────────────────────────────────────────────────────────
+  if (commandName === 'ask') {
+    const question = interaction.options.getString('質問');
+    await interaction.deferReply();
+    try {
+      const answer = await askAI(question);
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle('💼 高島への相談')
+        .addFields({ name: '質問', value: question })
+        .setDescription(answer)
+        .setFooter({ text: '高島 | 私の回答はあくまで参考です。最終判断はあなたたちがしてください。' });
+      return interaction.editReply({ embeds: [embed] });
+    } catch (e) {
+      console.error(e);
+      return interaction.editReply('高島です。現在応答できません。後ほど再度お試しください。');
+    }
+  }
+
+  // ── /posted ──────────────────────────────────────────────────────────────────
+  if (commandName === 'posted') {
+    const title = interaction.options.getString('タイトル');
+    const type = interaction.options.getString('種類');
+    const label = type === 'short' ? '📱 ショート' : '📺 横動画';
+
+    incrementWeeklyPosts();
+
+    const progressCh = findChannel(interaction.guild, CH.PROGRESS);
+    const weekCount = getWeeklyPosts();
+    const weekComment = weekCount >= 5
+      ? '今週は本数が出ています。質も維持できているか確認してください。'
+      : weekCount >= 3
+      ? 'ペースは悪くありません。このまま続けましょう。'
+      : '本数がまだ少ないです。ショートでもいいので積み上げてください。';
+
+    const embed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle('📹 投稿記録 — 高島')
+      .addFields(
+        { name: '種類', value: label, inline: true },
+        { name: '今週の投稿', value: `${weekCount}本目`, inline: true },
+      )
+      .setDescription(`**「${title}」** の投稿を確認しました。\n\n${weekComment}`)
+      .setFooter({ text: '高島 | 投稿した事実は財産です。続けてください。' });
+
+    if (progressCh) {
+      await progressCh.send({ embeds: [embed] }).catch(() => {});
+    }
+    return interaction.reply({ embeds: [embed] });
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
