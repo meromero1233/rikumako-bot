@@ -3,8 +3,9 @@ import { Client, GatewayIntentBits, Events, ChannelType, EmbedBuilder } from 'di
 import { setupServer } from './commands/setupServer.js';
 import {
   addTask, completeTask, deleteTask, getTasks, getPendingTasks,
-  setSubscribers, getSubscribers, getNextMilestone,
+  setSubscribers, getSubscribers, getNextMilestone, checkNewMilestone,
   incrementWeeklyPosts, getWeeklyPosts, resetWeeklyPosts,
+  recordPost, getDaysSinceLastPost, getStaleTasks,
 } from './store.js';
 import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary } from './ai.js';
 import { chat, generateScriptFromTrends } from './chat.js';
@@ -153,11 +154,70 @@ async function postMorningRoutine() {
   }
 }
 
+// ─── 週次目標投稿（月曜8時） ──────────────────────────────────────────────────────
+
+async function postWeeklyGoal() {
+  if (!isMondayJST()) return;
+  for (const guild of client.guilds.cache.values()) {
+    const chatCh = findChannel(guild, CH.CHAT);
+    if (!chatCh) continue;
+    const subs = getSubscribers();
+    const next = getNextMilestone();
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🎯 今週の目標 — 高島より')
+      .setDescription(
+        `おはようございます。今週もよろしくお願いします。\n\n` +
+        `**現在の登録者数：${subs.toLocaleString()}人**\n` +
+        `**次の目標：${next ? next.toLocaleString() + '人' : '100万人！'}**\n\n` +
+        `今週やること：\n` +
+        `✅ ショート動画 最低3本\n` +
+        `✅ 横動画 1本以上\n` +
+        `✅ サムネとタイトルのA/Bテスト\n\n` +
+        `数字を動かすのは行動だけです。今週も全力で。— 高島`,
+      )
+      .setFooter({ text: '高島 | 月曜の朝に動き出した人間が、週末に結果を出します。' });
+    await chatCh.send({ embeds: [embed] }).catch(() => {});
+  }
+}
+
+// ─── 投稿催促・タスク警告チェック（毎日12時） ────────────────────────────────────
+
+async function postAlerts() {
+  for (const guild of client.guilds.cache.values()) {
+    const chatCh = findChannel(guild, CH.CHAT);
+    const taskCh = findChannel(guild, CH.TASK);
+
+    // 3日以上投稿がない場合の催促
+    const daysSince = getDaysSinceLastPost();
+    if (chatCh && (daysSince === null || daysSince >= 3)) {
+      const msg = daysSince === null
+        ? `高島です。まだ一度も投稿が記録されていません。\`/posted\` で記録を始めてください。動かないと何も変わりません。— 高島`
+        : `高島です。最後の投稿から**${Math.floor(daysSince)}日**が経過しています。\nショートでもいいので今日中に1本出してください。止まると流れが死にます。— 高島`;
+      await chatCh.send(msg).catch(() => {});
+    }
+
+    // 2日以上放置されているタスクの警告
+    const staleTasks = getStaleTasks(2);
+    if (taskCh && staleTasks.length > 0) {
+      const lines = staleTasks.map((t) => `> **#${t.id}** ${t.text}（${Math.floor((Date.now() - new Date(t.createdAt).getTime()) / 86400000)}日放置）`).join('\n');
+      const embed = new EmbedBuilder()
+        .setColor(0xed4245)
+        .setTitle('⚠️ 放置タスクの警告 — 高島')
+        .setDescription(`以下のタスクが2日以上手付かずです。\n\n${lines}\n\n理由があるなら教えてください。ないなら今すぐ動いてください。`)
+        .setFooter({ text: '高島 | タスクは作るだけでは意味がありません。' });
+      await taskCh.send({ embeds: [embed] }).catch(() => {});
+    }
+  }
+}
+
 // ─── 起動 ──────────────────────────────────────────────────────────────────────
 
 client.once(Events.ClientReady, (c) => {
   console.log(`✅ ログイン完了: ${c.user.tag}`);
+  scheduleDailyJST(8, postWeeklyGoal);
   scheduleDailyJST(9, postMorningRoutine);
+  scheduleDailyJST(12, postAlerts);
 });
 
 // ─── スラッシュコマンド処理 ───────────────────────────────────────────────────────
@@ -235,6 +295,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === 'subscribers') {
     const n = interaction.options.getInteger('人数');
     const { prev, current } = setSubscribers(n);
+    const newMilestone = checkNewMilestone(prev, current);
+    if (newMilestone) {
+      const chatCh = findChannel(interaction.guild, CH.CHAT);
+      if (chatCh) {
+        const embed = new EmbedBuilder()
+          .setColor(0xffd700)
+          .setTitle(`🎉 ${newMilestone.toLocaleString()}人 達成！`)
+          .setDescription(`リクム、マコ。**${newMilestone.toLocaleString()}人**に到達しました。\nこれは通過点です。次は${(getNextMilestone() ?? 1000000).toLocaleString()}人。止まらないでください。— 高島`)
+          .setFooter({ text: '高島 | 祝うのは一瞬でいい。すぐ次に動いてください。' });
+        await chatCh.send({ embeds: [embed] }).catch(() => {});
+      }
+    }
     const next = getNextMilestone();
     const diff = current - prev;
 
@@ -342,7 +414,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const type = interaction.options.getString('種類');
     const label = type === 'short' ? '📱 ショート' : '📺 横動画';
 
-    incrementWeeklyPosts();
+    recordPost();
 
     const progressCh = findChannel(interaction.guild, CH.PROGRESS);
     const weekCount = getWeeklyPosts();
