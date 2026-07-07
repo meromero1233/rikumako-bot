@@ -7,6 +7,9 @@ import {
   incrementWeeklyPosts, getWeeklyPosts, resetWeeklyPosts,
 } from './store.js';
 import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary } from './ai.js';
+import { chat, generateScriptFromTrends } from './chat.js';
+import { searchTrends, searchQuery } from './search.js';
+import { persona } from './personas/rikumako.js';
 import { CH } from './config.js';
 
 const client = new Client({
@@ -99,16 +102,18 @@ async function postMorningRoutine() {
       }
     }
 
-    // ── トレンド情報投稿（AIが生成）──────────────────────────────────────────────
+    // ── トレンド情報投稿（Web検索 + AI生成）────────────────────────────────────
     const trendCh = findChannel(guild, CH.TREND);
     if (trendCh) {
       try {
-        const trends = await generateTrendIdeas();
+        const { answer, results } = await searchTrends(persona.searchKeywords);
+        const trendInfo = answer ? `${answer}\n\n参考記事:\n${results}` : results;
+        const scripts = await generateScriptFromTrends(persona, trendInfo);
         const embed = new EmbedBuilder()
           .setColor(0xfee75c)
-          .setTitle(`🔥 ${dateStr} — 高島のトレンド分析`)
-          .setDescription(trends)
-          .setFooter({ text: '高島 | 判定Aのものから検討してください。' });
+          .setTitle(`🔥 ${dateStr} — 高島のリアルタイムトレンド分析`)
+          .setDescription(scripts)
+          .setFooter({ text: '高島 | Web検索ベースの最新情報です。判定Aから検討してください。' });
         await trendCh.send({ embeds: [embed] }).catch(() => {});
       } catch (e) {
         console.error('trend error:', e);
@@ -361,6 +366,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await progressCh.send({ embeds: [embed] }).catch(() => {});
     }
     return interaction.reply({ embeds: [embed] });
+  }
+});
+
+// ─── メンション対応チャット ───────────────────────────────────────────────────────
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+  if (!message.mentions.has(client.user)) return;
+
+  const userText = message.content.replace(/<@!?\d+>/g, '').trim();
+  if (!userText) {
+    return message.reply('何かご用でしょうか？— 高島');
+  }
+
+  await message.channel.sendTyping();
+
+  try {
+    // 検索が必要そうなキーワードがあれば Web 検索して情報を補完
+    const needsSearch = /トレンド|最新|流行|ニュース|今|検索/.test(userText);
+    let searchContext = '';
+    if (needsSearch) {
+      const { answer } = await searchQuery(userText).catch(() => ({ answer: '' }));
+      searchContext = answer;
+    }
+
+    const reply = await chat(message.guildId, userText, persona, searchContext);
+    await message.reply(reply);
+  } catch (e) {
+    console.error('chat error:', e);
+    await message.reply('申し訳ありません、現在応答できません。後ほど再度お試しください。— 高島');
   }
 });
 
