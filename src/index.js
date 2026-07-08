@@ -10,6 +10,7 @@ import {
 import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary, generateShortsResearch } from './ai.js';
 import { chat, generateScriptFromTrends } from './chat.js';
 import { searchTrends, searchQuery } from './search.js';
+import { researchGenres, hasYouTube } from './youtube.js';
 import { persona } from './personas/rikumako.js';
 import { CH } from './config.js';
 
@@ -213,38 +214,71 @@ async function postAlerts() {
 
 // ─── 朝7時のショート研究レポート（Web検索ベース）──────────────────────────────
 
-async function postShortsResearch() {
-  const queries = [
-    'YouTube ショート動画 アルゴリズム 伸ばす方法 コツ',
-    'ショート動画 構成 台本 作り方 冒頭フック',
-    '都市伝説 YouTubeショート 人気 バズった動画 再生数',
-    '雑学 豆知識 ショート動画 人気 再生数',
-    'YouTubeショート トレンド ニュース 話題',
-  ];
+const MAKO_ID = '1430169208217403397';
+const RESEARCH_TONES = ['strict', 'kind', 'motivate'];
 
-  let digest = '';
-  for (const q of queries) {
-    try {
-      const { answer, results } = await searchQuery(q);
-      digest += `▼検索「${q}」\n${answer}\n${results}\n\n`;
-    } catch (e) {
-      console.error('research search error:', e.message);
-    }
+async function postShortsResearch() {
+  // 参考動画（実データ）をYouTube APIで取得。ジャンルごとに再生数上位を集める
+  let videoData;
+  if (hasYouTube()) {
+    videoData = await researchGenres([
+      { label: '都市伝説系', query: '都市伝説 怖い話 ショート' },
+      { label: '雑学系', query: '雑学 豆知識 ショート' },
+      { label: 'トレンドニュース系', query: 'ニュース 時事 解説 ショート' },
+    ]).catch((e) => { console.error('youtube error:', e.message); return null; });
   }
-  if (!digest) return;
+  if (!videoData) {
+    // YouTube未設定/失敗時はWeb検索でフォールバック
+    try {
+      const { results } = await searchQuery('都市伝説 雑学 YouTubeショート 人気 再生数');
+      videoData = results;
+    } catch { videoData = '（本日は動画データを取得できませんでした）'; }
+  }
+
+  // 戦略メモは週1回（月曜）だけ。Web検索で材料を集める
+  let strategyDigest = null;
+  if (isMondayJST()) {
+    const queries = [
+      'YouTube ショート動画 アルゴリズム 伸ばす方法 コツ',
+      'ショート動画 構成 台本 作り方 冒頭フック',
+    ];
+    let d = '';
+    for (const q of queries) {
+      try {
+        const { answer, results } = await searchQuery(q);
+        d += `▼「${q}」\n${answer}\n${results}\n\n`;
+      } catch (e) { console.error('strategy search error:', e.message); }
+    }
+    if (d) strategyDigest = d;
+  }
+
+  // 口調を日替わりで変える（曜日ベースで循環）
+  const tone = RESEARCH_TONES[jstNow().getUTCDay() % RESEARCH_TONES.length];
 
   try {
-    const report = await generateShortsResearch(digest);
+    const report = await generateShortsResearch({ videoData, tone, strategyDigest });
     const dateStr = jstNow().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'long' });
+    const title = strategyDigest
+      ? `📡 ${dateStr} 7時の朝会 — ショート研究レポート（今週の戦略つき）`
+      : `📡 ${dateStr} 7時の朝会 — ショート研究レポート`;
     for (const guild of client.guilds.cache.values()) {
       const ch = findChannel(guild, CH.TREND);
       if (!ch) continue;
       const embed = new EmbedBuilder()
         .setColor(0x00b0f4)
-        .setTitle(`📡 ${dateStr} 7時の朝会 — ショート研究レポート`)
+        .setTitle(title)
         .setDescription(report.slice(0, 4000))
         .setFooter({ text: '高島 | AIは道具です。魂を入れるのはあなたたちの仕事です。' });
       await ch.send({ embeds: [embed] }).catch(() => {});
+
+      // マコへの誘導：確認・質問はai相談室でどんどん
+      const consultCh = findChannel(guild, CH.AI_CHAT);
+      if (consultCh) {
+        await consultCh.send(
+          `<@${MAKO_ID}> マコさん、おはようございます。今日のレポート、目を通しておいてください。\n` +
+          `確認したいこと・迷っていること・小さな疑問、なんでも構いません。**このチャンネルにどんどん書いてください。** 一人で抱えて止まるのが一番もったいないので。— 高島`,
+        ).catch(() => {});
+      }
     }
     console.log('[research] 7am shorts research posted');
   } catch (e) {
