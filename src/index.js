@@ -7,7 +7,7 @@ import {
   incrementWeeklyPosts, getWeeklyPosts, resetWeeklyPosts,
   recordPost, getDaysSinceLastPost, getStaleTasks,
 } from './store.js';
-import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary } from './ai.js';
+import { generateScriptIdea, generateTrendIdeas, askAI, generateWeeklySummary, generateShortsResearch } from './ai.js';
 import { chat, generateScriptFromTrends } from './chat.js';
 import { searchTrends, searchQuery } from './search.js';
 import { persona } from './personas/rikumako.js';
@@ -211,10 +211,52 @@ async function postAlerts() {
   }
 }
 
+// ─── 朝7時のショート研究レポート（Web検索ベース）──────────────────────────────
+
+async function postShortsResearch() {
+  const queries = [
+    'YouTube ショート動画 アルゴリズム 伸ばす方法 コツ',
+    'ショート動画 構成 台本 作り方 冒頭フック',
+    '都市伝説 YouTubeショート 人気 バズった動画 再生数',
+    '雑学 豆知識 ショート動画 人気 再生数',
+    'YouTubeショート トレンド ニュース 話題',
+  ];
+
+  let digest = '';
+  for (const q of queries) {
+    try {
+      const { answer, results } = await searchQuery(q);
+      digest += `▼検索「${q}」\n${answer}\n${results}\n\n`;
+    } catch (e) {
+      console.error('research search error:', e.message);
+    }
+  }
+  if (!digest) return;
+
+  try {
+    const report = await generateShortsResearch(digest);
+    const dateStr = jstNow().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'long' });
+    for (const guild of client.guilds.cache.values()) {
+      const ch = findChannel(guild, CH.TREND);
+      if (!ch) continue;
+      const embed = new EmbedBuilder()
+        .setColor(0x00b0f4)
+        .setTitle(`📡 ${dateStr} 7時の朝会 — ショート研究レポート`)
+        .setDescription(report.slice(0, 4000))
+        .setFooter({ text: '高島 | AIは道具です。魂を入れるのはあなたたちの仕事です。' });
+      await ch.send({ embeds: [embed] }).catch(() => {});
+    }
+    console.log('[research] 7am shorts research posted');
+  } catch (e) {
+    console.error('shorts research error:', e);
+  }
+}
+
 // ─── 起動 ──────────────────────────────────────────────────────────────────────
 
 client.once(Events.ClientReady, (c) => {
   console.log(`✅ ログイン完了: ${c.user.tag}`);
+  scheduleDailyJST(7, postShortsResearch);
   scheduleDailyJST(8, postWeeklyGoal);
   scheduleDailyJST(9, postMorningRoutine);
   scheduleDailyJST(12, postAlerts);
