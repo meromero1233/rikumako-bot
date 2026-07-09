@@ -286,6 +286,45 @@ async function postShortsResearch() {
   }
 }
 
+// ─── 投稿リマインド（分析ツールのベスト投稿タイミングを取得して通知）───────────
+
+const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://yt-dashboard-production-d55e.up.railway.app').replace(/\/$/, '');
+const DOW_JP = ['日', '月', '火', '水', '木', '金', '土'];
+
+async function postPostingReminder() {
+  try {
+    const res = await fetch(`${DASHBOARD_URL}/api/dashboard`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const timing = data.timing;
+    if (!timing || !Array.isArray(timing.slots) || !timing.slots.length) return;
+
+    const todayDow = jstNow().getUTCDay();
+    // 今日が「狙い目の投稿日」（上位スロットに含まれる曜日）か判定
+    const todaySlots = timing.slots.filter((s) => s.dow === todayDow);
+    const isBestDay = timing.bestDow === todayDow || todaySlots.length > 0;
+    if (!isBestDay) return;
+
+    const hour = (todaySlots[0]?.hour ?? timing.bestHour);
+    const embed = new EmbedBuilder()
+      .setColor(0xf5c451)
+      .setTitle('📣 今日は狙い目の投稿日です！')
+      .setDescription(
+        `同ジャンルの人気動画を分析したところ、**${DOW_JP[todayDow]}曜 ${hour}時台**の投稿が伸びやすい傾向です。\n\n` +
+        `今日の動画は、この時間を狙って出しましょう。タイミングも実力のうちです。— 高島`,
+      )
+      .setFooter({ text: '高島 | ベストな時間に、ベストな一本を。' });
+
+    for (const guild of client.guilds.cache.values()) {
+      const ch = findChannel(guild, CH.TASK) || findChannel(guild, CH.TREND) || findChannel(guild, CH.CHAT);
+      if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
+    }
+    console.log('[reminder] 投稿リマインドを送信');
+  } catch (e) {
+    console.error('posting reminder error:', e.message);
+  }
+}
+
 // ─── 起動 ──────────────────────────────────────────────────────────────────────
 
 client.once(Events.ClientReady, (c) => {
@@ -293,6 +332,7 @@ client.once(Events.ClientReady, (c) => {
   scheduleDailyJST(7, postShortsResearch);
   scheduleDailyJST(8, postWeeklyGoal);
   scheduleDailyJST(9, postMorningRoutine);
+  scheduleDailyJST(10, postPostingReminder);
   scheduleDailyJST(12, postAlerts);
 });
 
